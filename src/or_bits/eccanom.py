@@ -1,9 +1,21 @@
-"""JAX-compiled functions for orbit propagation.
+"""JAX-compiled functions to compute the eccentric anomaly based on the orvara method.
 
 The primary entrance point is the `solve_E` function, which chooses the correct
-method based on the eccentricity value. When repeated calls will be made with the
-same eccentricity value, it is recommended to use the `get_E_solver` function which
-will return a JIT-compiled function with the eccentricity value fixed.
+method based on the eccentricity value. When repeated calls will be made with
+the same eccentricity value, it is recommended to use the `get_E_solver`
+function which will return a JIT-compiled function with the eccentricity value
+fixed.
+
+If the sine and cosine of the eccentric anomaly are also required, such as in
+RV calculations, the `solve_E_trig` function can be used. This function returns
+the eccentric anomaly along with the sine and cosine of the eccentric anomaly.
+Similarly, a JIT-compiled function can be obtained using the `get_E_trig_solver`
+and a specific eccentricity value to speed up repeated calculations.
+
+If high precision is not required, the `guess_E` function returns the initial
+guess for the eccentric anomaly calculated with a lookup table of polynomials.
+A compiled form for a specific `e` value can be obtained using the
+`get_E_guesser` function.
 """
 
 from functools import partial
@@ -45,6 +57,18 @@ def get_E_solver(e: float):
 @jax.jit
 def solve_E(M, e):
     return lax.cond(e < 0.78, le_E, he_E, M, e)
+
+
+def get_E_trig_solver(e: float):
+    """Get the eccentric anomaly solver for a specific eccentricity value."""
+    solve_E_trig_partial = partial(solve_E_trig, e=e)
+    solve_E_trig_jitted = jax.jit(solve_E_trig_partial)
+    return solve_E_trig_jitted
+
+
+@jax.jit
+def solve_E_trig(M, e):
+    return lax.cond(e < 0.78, le_E_trig, he_E_trig, M, e)
 
 
 def get_E_guesser(e: float):
