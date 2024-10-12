@@ -320,8 +320,10 @@ def dE_2nd(M, E, e_inv, sinE, cosE):
 def dE_3rd(M, E, e_inv, sinE, cosE):
     """Compute the third order approximation of dE."""
     num, denom = dE_num_denom(M, E, e_inv, sinE, cosE)
-    dE = num * (denom * denom + 0.5 * num * sinE) / denom * denom * denom + num * (
-        denom * sinE + if3 * num * cosE
+    dE = (
+        num
+        * (denom * denom + 0.5 * num * sinE)
+        / (denom * denom * denom + num * (denom * sinE + if3 * num * cosE))
     )
     return dE
 
