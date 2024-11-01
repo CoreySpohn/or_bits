@@ -47,6 +47,17 @@ elevenpi_d_12 = 11.0 * pi / 12.0
 two_pi = 2.0 * pi
 
 
+def create_E_func_multi_e(e_vals, func):
+    """Creates E solvers for all provided `e` values using the provided function."""
+    # Assure that the provided e_range is linearly spaced
+    funcs = {e: func(e) for e in e_vals}
+
+    def E_calc(e, M):
+        return funcs[e](M)
+
+    return E_calc
+
+
 def get_E_solver(e: float):
     """Get the eccentric anomaly solver for a specific eccentricity value."""
     solve_E_partial = partial(solve_E, e=e)
@@ -56,6 +67,11 @@ def get_E_solver(e: float):
 
 @jax.jit
 def solve_E(M, e):
+    # Not handling e == 0 case for now, would look something like this:
+    # e_ind = jnp.select([e == 0, e < 0.78], [0, 1], default=2)
+    # return lax.switch(e_ind, [identity_solver, le_E, he_E], M, e)
+    # where identity_solver returns M as E
+    M = jnp.mod(M, two_pi)
     return lax.cond(e < 0.78, le_E, he_E, M, e)
 
 
@@ -95,6 +111,89 @@ def guess_E(M: jnp.ndarray, e: float):
     Esigns, _M = cut_M(M)
     init_E = init_E_coeffs(_M, bounds, coeffs)
     return jnp.fmod(Esigns * init_E + two_pi, two_pi)
+
+
+def get_E_lookup(e, n=1800):
+    M_vals = jnp.linspace(0, two_pi, n, endpoint=False)
+    E_vals = solve_E(M_vals, e)
+    dM = M_vals[1] - M_vals[0]
+    inv_dM = 1.0 / dM
+    n_int = jnp.int32(n)
+
+    @jax.jit
+    def E_lookup(M):
+        return E_vals[(M * inv_dM).astype(jnp.int32) % n_int]
+
+    return E_lookup
+
+
+def get_E_lookup_d(e, n=1800):
+    # Linearly spaced mean anomaly values
+    M_vals = jnp.linspace(0, two_pi, n, endpoint=False)
+    dM = M_vals[1] - M_vals[0]
+    # Use the solve_E function to get the real eccentric anomaly values
+    # and the derivative of E (with respect to the array indices)
+    E_vals = solve_E(M_vals, e)
+    dE_dind = jnp.gradient(E_vals)
+
+    inv_dM = 1.0 / dM
+    n_int = jnp.int32(n)
+
+    @jax.jit
+    def interp_E(M):
+        # Scale M to index space
+        ind_M = M * inv_dM
+        # Get integer part of the index
+        ind_M_int = ind_M.astype(jnp.int32)
+        # Get the fractional part of the index
+        dind = ind_M - ind_M_int
+        # Wrap to [0, 2pi) indices with modulo n
+        final_inds = ind_M_int % n_int
+        # Linear interpolation
+        return E_vals[final_inds] + dE_dind[final_inds] * dind
+
+    return interp_E
+
+
+def get_E_lookup_hermite(e, n=1800):
+    # Generate linearly spaced mean anomaly values
+    M_vals = jnp.linspace(0, two_pi, n, endpoint=False)
+    # Compute the step size in mean anomaly per index
+    dM = M_vals[1] - M_vals[0]
+    # Solve for eccentric anomaly for each mean anomaly
+    E_vals = solve_E(M_vals, e)
+    # Compute the derivative of E with respect to the index
+    dE_dind = jnp.gradient(E_vals)
+
+    @jax.jit
+    def E_lookup(M):
+        # Wrap M to the range [0, two_pi]
+        _M = jnp.mod(M, two_pi)
+        # Determine the fractional index and the integer part
+        # dind, ind_float = jnp.modf(_M / dind_dM)
+        dind, ind_float = jnp.modf(jnp.true_divide(_M, dM))
+        ind_int = ind_float.astype(int)
+        # Handle wrap-around for the next index
+        ind_next = (ind_int + 1) % n
+
+        # Retrieve function values and derivatives at the surrounding indices
+        E_i = E_vals[ind_int]
+        E_ip1 = E_vals[ind_next]
+        dE_i = dE_dind[ind_int]
+        dE_ip1 = dE_dind[ind_next]
+
+        # Hermite basis functions
+        h00 = 2 * dind**3 - 3 * dind**2 + 1
+        h10 = dind**3 - 2 * dind**2 + dind
+        h01 = -2 * dind**3 + 3 * dind**2
+        h11 = dind**3 - dind**2
+
+        # Perform Hermite interpolation
+        E_interp = h00 * E_i + h10 * dE_i + h01 * E_ip1 + h11 * dE_ip1
+
+        return E_interp
+
+    return E_lookup
 
 
 @jax.jit
@@ -261,10 +360,10 @@ def init_E_poly(M, e):
             Initial estimate of the eccentric anomaly in radians.
     """
     ome = 1.0 - e
-    sqrt_ome = jnp.sqrt(ome)
+    sqrt_ome = lax.sqrt(ome)
     chi = M / (sqrt_ome * ome)
-    Lam = jnp.sqrt(8.0 + 9.0 * chi**2)
-    S = jnp.cbrt(Lam + 3.0 * chi)
+    Lam = lax.sqrt(8.0 + 9.0 * chi**2)
+    S = lax.cbrt(Lam + 3.0 * chi)
     S_squared = S * S
     sigma = 6.0 * chi / (2.0 + S_squared + 4.0 / S_squared)
     s2 = sigma * sigma
@@ -326,6 +425,30 @@ def dE_3rd(M, E, e_inv, sinE, cosE):
         / (denom * denom * denom + num * (denom * sinE + if3 * num * cosE))
     )
     return dE
+
+
+def compute_dE_single(M, init_E_val, e_inv_val, sinE_val, cosE_val):
+    """Computes dE for a single element based on the condition M > 0.4.
+
+    Args:
+        M (float): Single element from _M.
+        init_E_val (float): Corresponding element from init_E.
+        e_inv_val (float): Inverse of eccentricity.
+        sinE_val (float): Sine of E.
+        cosE_val (float): Cosine of E.
+
+    Returns:
+        float: Computed dE for the element.
+    """
+    return jax.lax.cond(
+        M > 0.4, dE_2nd, dE_3rd, M, init_E_val, e_inv_val, sinE_val, cosE_val
+    )
+
+
+# Vectorize the compute_dE_single function
+compute_dE_vectorized = jax.vmap(
+    compute_dE_single, in_axes=(0, 0, None, 0, 0), out_axes=0
+)
 
 
 @jax.jit
@@ -400,17 +523,12 @@ def he_E(M: jnp.ndarray, e: float):
     Esigns, _M = cut_M(M)
 
     # Get initial guess
+    # TODO: Come up with a way to do this without evaluating both functions
     cond1 = (2 * _M + (1 - e)) > 0.2
     init_E = jnp.where(cond1, init_E_coeffs(_M, bounds, coeffs), init_E_poly(_M, e))
-    # TODO: Come up with a way to do this without evaluating both functions
 
     sinE, cosE = fast_sinE_cosE(init_E)
-    cond2 = _M > 0.4
-    dE = jnp.where(
-        cond2,
-        dE_2nd(_M, init_E, e_inv, sinE, cosE),
-        dE_3rd(_M, init_E, e_inv, sinE, cosE),
-    )
+    dE = compute_dE_vectorized(_M, init_E, e_inv, sinE, cosE)
     E = jnp.fmod(Esigns * (init_E + dE) + two_pi, two_pi)
     return E
 
@@ -435,17 +553,12 @@ def he_E_trig(M: jnp.ndarray, e: float):
     Esigns, _M = cut_M(M)
 
     # Get initial guess
+    # TODO: Come up with a way to do this without evaluating both functions
     cond1 = (2 * _M + (1 - e)) > 0.2
     init_E = jnp.where(cond1, init_E_coeffs(_M, bounds, coeffs), init_E_poly(_M, e))
-    # TODO: Come up with a way to do this without evaluating both functions
 
     sinE, cosE = fast_sinE_cosE(init_E)
-    cond2 = _M > 0.4
-    dE = jnp.where(
-        cond2,
-        dE_2nd(_M, init_E, e_inv, sinE, cosE),
-        dE_3rd(_M, init_E, e_inv, sinE, cosE),
-    )
+    dE = compute_dE_vectorized(_M, init_E, e_inv, sinE, cosE)
     dEsq_d6 = dE**2 * if3
     E = jnp.fmod(Esigns * (init_E + dE) + two_pi, two_pi)
     sinE = Esigns * (sinE * (1 - 3 * dEsq_d6) + dE * (1 - dEsq_d6) * cosE)
@@ -457,7 +570,7 @@ def he_E_trig(M: jnp.ndarray, e: float):
 def Etrig_1(E):
     """When E <= pi_d_4."""
     sinE = shortsin(E)
-    cosE = jnp.sqrt(1.0 - sinE**2)
+    cosE = lax.sqrt(1.0 - sinE**2)
     return sinE, cosE
 
 
@@ -465,7 +578,7 @@ def Etrig_1(E):
 def Etrig_2(E):
     """When E > pi_d_4 and E < three_pi_d_4."""
     cosE = shortsin(pi_d_2 - E)
-    sinE = jnp.sqrt(1.0 - cosE**2)
+    sinE = lax.sqrt(1.0 - cosE**2)
     return sinE, cosE
 
 
@@ -473,7 +586,7 @@ def Etrig_2(E):
 def Etrig_3(E):
     """When E > pi_d_2 and E > three_pi_d_4."""
     sinE = shortsin(pi - E)
-    cosE = -jnp.sqrt(1.0 - sinE**2)
+    cosE = -lax.sqrt(1.0 - sinE**2)
     return sinE, cosE
 
 
@@ -490,3 +603,9 @@ def fast_sinE_cosE(E):
     Ei = jnp.select([E <= pi_d_4, E < threepi_d_4], [0, 1], default=2)
     sinE, cosE = jax.vmap(Etrig, in_axes=(0, 0))(Ei, E)
     return sinE, cosE
+
+
+@jax.jit
+def identity_solver(M, e):
+    """Returns M as E when e is 0."""
+    return M
